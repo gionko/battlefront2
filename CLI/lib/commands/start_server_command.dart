@@ -111,10 +111,13 @@ class StartServerCommand extends Command<int> {
   final Logger _logger;
   final Stream<LogEntry> logStream;
 
+  bool get _isLanMode =>
+      Platform.environment['KYBER_LAN_MODE']?.toLowerCase() == 'true';
+
   @override
   Future<int> run() async {
     final allowDedicated = Platform.environment['KYBER_BYPASS_DOCKER_I_REALLY_KNOW_WHAT_I_AM_DOING'];
-    if (allowDedicated == null || allowDedicated.isEmpty) {
+    if (!_isLanMode && (allowDedicated == null || allowDedicated.isEmpty)) {
       _logger.info(
         'To host dedicated servers, please use our Docker image. For more information, visit https://docs.kyber.gg',
       );
@@ -137,7 +140,12 @@ class StartServerCommand extends Command<int> {
     late String playerName;
     final loginCredentials = argResults?['credentials'] as String?;
     try {
-      if (loginCredentials == null) {
+      if (_isLanMode) {
+        playerName = Platform.environment['KYBER_LAN_PLAYER_NAME'] ??
+            loginCredentials?.split(':').first ??
+            'DedicatedServer';
+        _logger.info('LAN mode: using player name "$playerName"');
+      } else if (loginCredentials == null) {
         final player = await loginFlow();
         playerName = player.displayName;
       } else {
@@ -247,9 +255,14 @@ class StartServerCommand extends Command<int> {
       kToken = argResults?['token'] as String;
     } else {
       try {
-        final authToken = await getAuthToken();
-        final resp = await sl.get<KyberGRPCService>().login(authToken);
-        kToken = resp.token;
+        if (_isLanMode) {
+          final resp = await sl.get<KyberGRPCService>().login(playerName);
+          kToken = resp.token;
+        } else {
+          final authToken = await getAuthToken();
+          final resp = await sl.get<KyberGRPCService>().login(authToken);
+          kToken = resp.token;
+        }
       } catch (e) {
         if (e is GrpcError) {
           if (e.code == StatusCode.unauthenticated ||
@@ -296,6 +309,9 @@ class StartServerCommand extends Command<int> {
     Env.set('KYBER_INTERFACE_PORT', kyberPort);
     Env.set('KYBER_API_HOSTNAME', sl.get<KyberGRPCService>().host);
     Env.set('KYBER_HTTP_HOSTNAME', sl.get<KyberGRPCService>().httpHostname);
+    if (_isLanMode) {
+      Env.set('KYBER_INSECURE', '1');
+    }
 
     await _fetchLicense(id: licenseId, isFile: true);
 

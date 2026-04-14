@@ -103,6 +103,9 @@ class KyberCliCommandRunner extends CompletionCommandRunner<int> {
       });
 
       final apiEnv = Platform.environment['KYBER_API_ENV'] ?? 'prod';
+      final isLanMode =
+          Platform.environment['KYBER_LAN_MODE']?.toLowerCase() == 'true';
+      final lanHost = Platform.environment['KYBER_LAN_HOST'] ?? 'localhost';
 
       const skipCommands = ['get_token', 'get_ea_token'];
       if (!skipCommands.contains(topLevelResults.command?.name)) {
@@ -110,11 +113,16 @@ class KyberCliCommandRunner extends CompletionCommandRunner<int> {
       }
 
       Env.set('KYBER_ENVIRONMENT', apiEnv);
-      sl.registerSingleton(KyberGRPCService.fromEnv(apiEnv));
+      sl.registerSingleton(
+        isLanMode
+            ? KyberGRPCService.lan(lanHost)
+            : KyberGRPCService.fromEnv(apiEnv),
+      );
 
       if (topLevelResults.command != null &&
           !topLevelResults.arguments.contains('--help')) {
-        if (!topLevelResults.arguments.contains('--skip-updates') &&
+        if (!isLanMode &&
+            !topLevelResults.arguments.contains('--skip-updates') &&
             !Platform.isLinux &&
             [
               'start_server',
@@ -185,8 +193,8 @@ class KyberCliCommandRunner extends CompletionCommandRunner<int> {
         }
 
         final command = topLevelResults.command!;
-        final isDummy =
-            command.name == 'start_server' && command['credentials'] != null;
+        final isDummy = isLanMode ||
+            (command.name == 'start_server' && command['credentials'] != null);
         await mx.startMaxima(dummyAuthStorage: isDummy);
       }
 
