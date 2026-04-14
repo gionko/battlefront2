@@ -11,6 +11,7 @@ import 'package:kyber_launcher/core/services/notification_service.dart';
 import 'package:kyber_launcher/features/maxima/providers/maxima_cubit.dart';
 import 'package:kyber_launcher/features/patreon/services/patreon_service.dart';
 import 'package:kyber_launcher/gen/fonts.gen.dart';
+import 'package:kyber_launcher/injection_container.dart' show isLanMode;
 import 'package:kyber_launcher/shared/ui/buttons/button.dart';
 import 'package:kyber_launcher/shared/ui/elements/kyber_input.dart';
 import 'package:kyber_launcher/shared/ui/utils/background_blur.dart';
@@ -105,6 +106,16 @@ class _MaximaLoginState extends State<MaximaLogin> {
 
     final errorBlock = _buildErrorBlock(context, state);
     if (errorBlock != null) return errorBlock;
+
+    if (isLanMode) {
+      return switch (state.status) {
+        .loading => const _StatusRow(text: 'Connecting...'),
+        _ => _LanLoginForm(
+            onLogin: (username) =>
+                context.read<MaximaCubit>().requestLanLogin(username),
+          ),
+      };
+    }
 
     return switch (state.status) {
       .starting => const _StatusRow(text: 'Maxima is starting...'),
@@ -254,7 +265,7 @@ class _Header extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      'EA Login',
+      isLanMode ? 'LAN Login' : 'EA Login',
       style: FluentTheme.of(context).typography.subtitle?.copyWith(
         fontFamily: FontFamily.battlefrontUI,
         fontSize: 26,
@@ -500,6 +511,66 @@ class _MaximaGenericError extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _LanLoginForm extends StatefulWidget {
+  const _LanLoginForm({required this.onLogin});
+
+  final void Function(String username) onLogin;
+
+  @override
+  State<_LanLoginForm> createState() => _LanLoginFormState();
+}
+
+class _LanLoginFormState extends State<_LanLoginForm> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final name = _controller.text.trim();
+    if (name.isNotEmpty) {
+      widget.onLogin(name);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Enter your player name to join the LAN party.',
+          style: FluentTheme.of(context).typography.body,
+        ),
+        const SizedBox(height: 12),
+        TextBox(
+          controller: _controller,
+          placeholder: 'Player name',
+          onSubmitted: (_) => _submit(),
+          autofocus: true,
+          style: const TextStyle(
+            fontFamily: FontFamily.battlefrontUI,
+            fontSize: 16,
+          ),
+        ),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            KyberButton(
+              text: 'Join LAN',
+              onPressed: _submit,
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

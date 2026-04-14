@@ -20,6 +20,7 @@ import 'package:kyber_launcher/features/maxima/dialogs/maxima_game_not_found_dia
 import 'package:kyber_launcher/gen/rust/api/archive.dart';
 import 'package:kyber_launcher/gen/rust/api/maxima.dart';
 import 'package:kyber_launcher/injection_container.dart';
+import 'package:kyber_launcher/injection_container.dart' show isLanMode;
 import 'package:kyber_launcher/main.dart';
 import 'package:kyber_launcher/shared/ui/dialog/kyber_dialog.dart';
 import 'package:logging/logging.dart';
@@ -102,6 +103,12 @@ class MaximaCubit extends Cubit<MaximaState> {
   Future<void> init({bool skipSetupCheck = false}) async {
     if (state.status == MaximaStatus.loaded ||
         !skipSetupCheck && !Preferences.general.setup) {
+      return;
+    }
+
+    if (isLanMode) {
+      logger.info('LAN mode: skipping Maxima initialization');
+      emit(state.copyWith(status: MaximaStatus.loaded));
       return;
     }
 
@@ -227,6 +234,52 @@ class MaximaCubit extends Cubit<MaximaState> {
     );
   }
 
+  Future<void> requestLanLogin(String username) async {
+    if (_loggingIn) return;
+    _loggingIn = true;
+
+    try {
+      emit(state.copyWith(status: MaximaStatus.loading));
+
+      logger.info('LAN login as $username');
+      final resp = await sl.get<KyberGRPCService>().login(username);
+      ProcessEnv.set('KYBER_API_TOKEN', resp.token);
+
+      final servicePlayer = ServicePlayer(
+        id: resp.id,
+        pd: resp.id,
+        psd: '0',
+        displayName: resp.name,
+        uniqueName: resp.name,
+        nickname: resp.name,
+        relationship: '',
+      );
+
+      emit(
+        state.copyWith(
+          loggedIn: true,
+          entitlements: const [],
+          servicePlayer: servicePlayer,
+          status: MaximaStatus.loaded,
+          isPatron: false,
+        ),
+      );
+
+      logger.info('LAN login complete: ${resp.name} (${resp.id})');
+
+      _updateTimer ??= Timer.periodic(
+        const Duration(minutes: 5),
+        (_) async => verifyToken(),
+      );
+    } catch (e, s) {
+      logger.severe('LAN login error:', e, s);
+      final message = e is GrpcError ? (e.message ?? e.toString()) : e.toString();
+      emit(MaximaState(status: MaximaStatus.error, error: message));
+    } finally {
+      _loggingIn = false;
+    }
+  }
+
   Future<void> requestLogin({bool skipMaximaCheck = false}) async {
     if (_loggingIn) {
       return Future.error('Already logging in');
@@ -240,7 +293,7 @@ class MaximaCubit extends Cubit<MaximaState> {
       status = cubit.state;
     }
 
-    if (status.status == KyberStatusEnum.down) {
+    if (status.status == KyberStatusEnum.down && !isLanMode) {
       _updateTimer?.cancel();
 
       logger.severe('Kyber is down... Skipping login');
