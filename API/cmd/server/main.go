@@ -87,9 +87,11 @@ func main() {
 		panic("MINIO_HOST, MINIO_ACCESS_KEY, and MINIO_SECRET_KEY must be set")
 	}
 
+	minioSecure := os.Getenv("MINIO_SECURE") != "false"
+
 	minioClient, err := minio.New(minioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: true,
+		Secure: minioSecure,
 	})
 
 	if err != nil {

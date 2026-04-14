@@ -44,23 +44,22 @@ func NewReportServer(store *db.Store, sm *ws.ServerManager, client mq.Client) *R
 	minioEndpoint := os.Getenv("R2_HOST")
 	accessKey := os.Getenv("R2_ACCESS_KEY")
 	secretKey := os.Getenv("R2_SECRET_KEY")
-
-	if minioEndpoint == "" || accessKey == "" || secretKey == "" {
-		panic("R2_HOST, R2_ACCESS_KEY, and R2_SECRET_KEY must be set")
-	}
-
-	minioClient, err := minio.New(minioEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: true,
-	})
-
 	bucketName := os.Getenv("R2_BUCKET_NAME")
-	if bucketName == "" {
-		panic("R2_BUCKET_NAME must be set")
-	}
 
-	if err != nil {
-		panic("Failed to create MinIO client: " + err.Error())
+	var minioClient *minio.Client
+	if minioEndpoint != "" && accessKey != "" && secretKey != "" && bucketName != "" {
+		r2Secure := os.Getenv("MINIO_SECURE") != "false"
+		var err error
+		minioClient, err = minio.New(minioEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+			Secure: r2Secure,
+		})
+		if err != nil {
+			logger.L().Warn("Failed to create R2/MinIO client for reports, report uploads will be disabled", zap.Error(err))
+			minioClient = nil
+		}
+	} else {
+		logger.L().Warn("R2 configuration incomplete, report uploads will be disabled")
 	}
 
 	return &ReportServiceServer{
@@ -136,6 +135,10 @@ func (s *ReportServiceServer) GetUserInfo(ctx context.Context, req *pbapi.UserIn
 }
 
 func (s *ReportServiceServer) GenerateEvidenceLinks(ctx context.Context, req *pbapi.GenerateEvidenceLinksRequest) (*pbapi.GenerateEvidenceLinksResponse, error) {
+	if s.minio == nil {
+		return nil, status.Error(codes.Unavailable, "Report uploads are not configured")
+	}
+
 	links := make([]string, 0)
 	for ext, count := range req.FileExtensions {
 		if !allowedExt[ext] {

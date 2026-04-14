@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:get_it/get_it.dart';
 import 'package:kyber/kyber.dart';
 import 'package:kyber_launcher/core/services/app_settings.dart';
@@ -17,10 +19,18 @@ import 'package:kyber_launcher/features/plugin_manager/services/plugin_manager.d
 
 final GetIt sl = GetIt.instance;
 
+bool get isLanMode =>
+    Platform.environment['KYBER_LAN_MODE']?.toLowerCase() == 'true';
+
+String get lanHost =>
+    Platform.environment['KYBER_LAN_HOST'] ?? 'localhost';
+
 void initializeDependencies() {
   sl
     ..registerSingleton<KyberGRPCService>(
-      KyberGRPCService.fromEnv(Preferences.admin.apiEnv),
+      isLanMode
+          ? KyberGRPCService.lan(lanHost)
+          : KyberGRPCService.fromEnv(Preferences.admin.apiEnv),
     )
     ..registerSingleton<RichPresence>(RichPresence())
     ..registerSingleton<MaximaInstanceService>(MaximaInstanceService())

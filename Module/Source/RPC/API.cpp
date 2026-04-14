@@ -70,12 +70,20 @@ void ListenToStateChanges(const std::shared_ptr<grpc::Channel>& channel) {
 
 API::API(std::string token)
 {
-    auto credentials = grpc::SslCredentials(GetSslOptions());
-
     std::string rpcUri = PlatformUtils::GetEnv("KYBER_API_HOSTNAME", "api-rpc.prod.kyber.gg");
     std::string httpUri = PlatformUtils::GetEnv("KYBER_HTTP_HOSTNAME", "api.prod.kyber.gg");
-    
-    std::shared_ptr<Channel> channel = grpc::CreateChannel(rpcUri, credentials);
+
+    std::shared_ptr<Channel> channel;
+    if (!PlatformUtils::GetEnv("KYBER_INSECURE").empty())
+    {
+        KYBER_LOG(Info, "[RPC] Using insecure gRPC channel (LAN mode)");
+        channel = grpc::CreateChannel(rpcUri, grpc::InsecureChannelCredentials());
+    }
+    else
+    {
+        auto credentials = grpc::SslCredentials(GetSslOptions());
+        channel = grpc::CreateChannel(rpcUri, credentials);
+    }
 
     m_stateListenerThread = std::thread(ListenToStateChanges, channel);
 

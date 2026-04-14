@@ -34,6 +34,14 @@ class KyberGRPCService {
         httpHostname: 'api.$env.kyber.gg',
       );
 
+  factory KyberGRPCService.lan(String host, {int port = 9027}) =>
+      KyberGRPCService(
+        host,
+        port,
+        isInsecure: true,
+        httpHostname: host,
+      );
+
   final String httpHostname;
 
   void _setChannels() {

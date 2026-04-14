@@ -1,0 +1,83 @@
+version: "3.8"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+
+  api:
+    build:
+      context: ../../API
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "9027:9027"
+      - "9028:9028"
+    environment:
+      KYBER_LAN_MODE: "true"
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URI: redis://redis:6379
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_HOST: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      GRPC_PORT: "9027"
+      HTTP_PORT: "9028"
+      WHITELIST_ENABLED: "false"
+      SENTRY_DSN: ""
+    volumes:
+      - ./config:/srv/kyber-api/config:ro
+    depends_on:
+      - mongo
+      - redis
+      - rabbitmq
+      - minio
+
+  proxy:
+    build:
+      context: ../../Proxy
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      JWKS_URL: http://api:9028/.well-known/jwks.json
+      LISTEN_ADDR: 0.0.0.0:8080
+      SENTRY_DSN: ""
+    depends_on:
+      - api
+
+volumes:
+  mongo_data:
+  minio_data:

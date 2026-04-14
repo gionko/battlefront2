@@ -3,6 +3,8 @@ package rpc
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -54,13 +57,23 @@ type AuthenticationServer struct {
 	usersClient      *pbea.UsersClient
 	discordHelper    *discord.Helper
 	whitelistEnabled bool
+	lanMode          bool
 	pbapi.UnimplementedAuthenticationServer
 }
 
 func NewAuthenticationServer(ctx context.Context, store *db.Store, mqClient mq.Client) *AuthenticationServer {
-	eaJwks, err := ea2.LoadJwks()
-	if err != nil {
-		panic(fmt.Sprintf("failed to load EA JWKS: %v", err))
+	lanMode := strings.ToLower(os.Getenv("KYBER_LAN_MODE")) == "true"
+
+	var eaJwks map[string]*rsa.PublicKey
+	if lanMode {
+		logger.L().Info("LAN mode enabled: skipping EA JWKS loading")
+		eaJwks = make(map[string]*rsa.PublicKey)
+	} else {
+		var err error
+		eaJwks, err = ea2.LoadJwks()
+		if err != nil {
+			panic(fmt.Sprintf("failed to load EA JWKS: %v", err))
+		}
 	}
 
 	whitelistEnabled := true
@@ -127,6 +140,7 @@ func NewAuthenticationServer(ctx context.Context, store *db.Store, mqClient mq.C
 		usersClient:      usersClient,
 		discordHelper:    discordHelper,
 		whitelistEnabled: whitelistEnabled,
+		lanMode:          lanMode,
 	}
 }
 
@@ -383,7 +397,70 @@ func (s *AuthenticationServer) ResetToken(ctx context.Context, _ *pbcommon.Empty
 	return &pbcommon.Empty{}, nil
 }
 
+func (s *AuthenticationServer) lanLogin(ctx context.Context, req *pbapi.LoginRequest) (*pbapi.LoginResponse, error) {
+	username := strings.TrimSpace(req.GetToken())
+	if username == "" {
+		return nil, status.Error(codes.InvalidArgument, "Username is required")
+	}
+
+	hash := sha256.Sum256([]byte(username))
+	pid := hex.EncodeToString(hash[:8])
+
+	userIP := "127.0.0.1"
+	if p, ok := peer.FromContext(ctx); ok {
+		userIP = p.Addr.String()
+		if idx := strings.LastIndex(userIP, ":"); idx != -1 {
+			userIP = userIP[:idx]
+		}
+	}
+
+	user, err := s.store.Users.GetByID(ctx, pid)
+	if err != nil {
+		logger.L().Error("LAN login: failed to get user", zap.Error(err))
+		return nil, status.Error(codes.Internal, "Failed to get user")
+	}
+
+	if user == nil {
+		user, err = s.store.Users.Create(ctx, ea2.JwtUserPersonaInformationClaims{
+			ID:  0,
+			Ns:  "cem_ea_id",
+			Dis: username,
+			Nic: username,
+		}, ea2.EAJwtNexusClaims{
+			Pid: pid,
+		}, userIP)
+		if err != nil {
+			logger.L().Error("LAN login: failed to create user", zap.Error(err))
+			return nil, status.Error(codes.Internal, "Failed to create user")
+		}
+		logger.L().Info(fmt.Sprintf("LAN: Created user %s (%s)", username, pid))
+	} else {
+		user.UpsertIP(userIP)
+		_ = s.store.Users.Update(ctx, user.ID, bson.M{
+			"$set": bson.M{
+				"last_seen": time.Now(),
+				"name":      username,
+			},
+		})
+	}
+
+	s.publishPlayerLoggedIn(*user)
+
+	logger.L().Info(fmt.Sprintf("LAN: User %s (%s) logged in", username, pid))
+	return &pbapi.LoginResponse{
+		Id:           user.ID,
+		Name:         username,
+		Token:        user.Token,
+		Entitlements: []string{},
+		IsPatreon:    false,
+	}, nil
+}
+
 func (s *AuthenticationServer) Login(ctx context.Context, req *pbapi.LoginRequest) (*pbapi.LoginResponse, error) {
+	if s.lanMode {
+		return s.lanLogin(ctx, req)
+	}
+
 	meta, exist := metadata.FromIncomingContext(ctx)
 	if !exist {
 		return nil, status.Error(codes.Unauthenticated, "Missing metadata")

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ArmchairDevelopers/Kyber/API/api/v1/pbapi"
@@ -25,6 +26,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -457,7 +459,15 @@ func (s *ServerBrowserServer) RegisterServer(ctx context.Context, req *pbapi.Reg
 
 	addr := meta.Get("cf-connecting-ip")
 	if len(addr) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "Missing IP address")
+		if p, ok := peer.FromContext(ctx); ok {
+			peerAddr := p.Addr.String()
+			if idx := strings.LastIndex(peerAddr, ":"); idx != -1 {
+				peerAddr = peerAddr[:idx]
+			}
+			addr = []string{peerAddr}
+		} else {
+			return nil, status.Error(codes.Unauthenticated, "Missing IP address")
+		}
 	}
 
 	user := ctx.Value("user").(*models.UserModel)
