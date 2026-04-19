@@ -62,14 +62,78 @@ async fn create_maxima_instance() {
     }
 }
 
+async fn ensure_maxima() {
+    unsafe {
+        if _maxima.is_none() {
+            use maxima::core::MaximaOptionsBuilder;
+            let lan = std::env::var("KYBER_LAN_MODE").map(|v| v == "true").unwrap_or(false);
+            let options = MaximaOptionsBuilder::default()
+                .load_auth_storage(!lan)
+                .dummy_local_user(lan)
+                .build()
+                .unwrap();
+            _maxima = Some(maxima::core::Maxima::new_with_options(options).await.unwrap());
+        }
+    }
+}
+
+/// Explicit LAN init to be called from Dart before any other Maxima FFI call.
+/// Initializes Maxima with dummy_local_user so offline game launch works.
+/// Also installs/starts the Maxima background service — required for DLL
+/// injection into SWBF2 (game anti-tamper rejects user-mode injection,
+/// only the SYSTEM-level service can inject successfully).
+pub async fn init_lan_mode() -> anyhow::Result<()> {
+    ensure_maxima().await;
+    native_setup().await?;
+    Ok(())
+}
+
 fn maxima() -> &'static LockedMaxima {
     unsafe { _maxima.as_ref().unwrap() }
 }
 
 #[cfg(windows)]
 pub async fn inject_kyber(pid: u32, path: String) -> anyhow::Result<()> {
-    use maxima::core::background_service::request_library_injection;
-    Ok(request_library_injection(pid, &path).await?)
+    use maxima::core::background_service::request_library_injection_with_env;
+    use std::collections::HashMap;
+
+    // LAN/Steam target processes (e.g. SWBF2 spawned by Steam, not by
+    // bootstrap) do not inherit the KYBER_* env vars we set on the
+    // Launcher's PEB. Collect them here and pass to the service so it
+    // can WriteProcessMemory them into the target's PEB before
+    // LoadLibraryA, making them visible to the Module's static CRT.
+    let mut env: HashMap<String, String> = HashMap::new();
+    for key in [
+        "KYBER_API_TOKEN",
+        "KYBER_API_HOSTNAME",
+        "KYBER_HTTP_HOSTNAME",
+        "KYBER_INTERFACE_PORT",
+        "KYBER_MODULE_VERSION",
+        "KYBER_LAUNCHER_PORT",
+        "KYBER_LAN_MODE",
+        "KYBER_LAN_HOST",
+        "KYBER_INSECURE",
+        "KYBER_LOG_LEVEL",
+        "KYBER_DEDICATED_SERVER",
+        "KYBER_HIDE_CONSOLE",
+        "KYBER_HIDE_CONSOLE_WINDOW",
+        "KYBER_MESSAGE_DEBUG",
+        "KYBER_STDIN_CONSOLE",
+        "KYBER_SENTRY_DEBUG",
+        "KYBER_ONLINE_MODE",
+        "KYBER_DEV_MODE",
+        "KYBER_DISABLE_MODLOADER",
+        "KYBER_PRESERVE_CRASH_DUMP",
+        "KYBER_USE_DIRTY_SOCK",
+        "GRPC_TRACE",
+        "GRPC_VERBOSITY",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            env.insert(key.to_string(), v);
+        }
+    }
+
+    Ok(request_library_injection_with_env(pid, &path, env).await?)
 }
 
 #[cfg(not(windows))]
@@ -218,6 +282,24 @@ pub async fn get_rtm_presences(presence_sink: StreamSink<RtmPresence>) -> anyhow
 }
 
 pub async fn lsx_get_event_stream(pid: u32, is_startup: Option<bool>, game_sink: StreamSink<String>) {
+    let lan_mode = std::env::var("KYBER_LAN_MODE").map(|v| v == "true").unwrap_or(false);
+
+    // In LAN mode (e.g. Steam) the game never talks LSX and Maxima's
+    // `playing` tracks only the short-lived bootstrap process. Poll the
+    // real game PID directly; close the stream only when it truly exits.
+    if lan_mode {
+        use sysinfo::{Pid, System, SystemExt};
+        let pid_obj = Pid::from(pid as usize);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut sys = System::new();
+            sys.refresh_process(pid_obj);
+            if sys.process(pid_obj).is_none() {
+                return;
+            }
+        }
+    }
+
     let maxima_arc = maxima().clone();
     let timeout = if is_startup.is_none() {
         std::time::Duration::from_millis(25)
@@ -336,34 +418,109 @@ pub async fn start_game(
     game_path_override: Option<String>,
     game_args: Option<Vec<String>>,
 ) -> anyhow::Result<u32> {
+    ensure_maxima().await;
     let maxima_arc = maxima().clone();
 
-    let offer_id = {
-        let mut maxima = maxima_arc.lock().await;
-        let game = maxima.mut_library().game_by_base_slug(&game_slug).await;
-        if game.is_err() {
-            bail!(game.err().unwrap())
-        }
+    let lan_mode = std::env::var("KYBER_LAN_MODE").map(|v| v == "true").unwrap_or(false);
 
-        let game = game?;
-        if game.is_none() {
-            bail!("Game not found");
+    let mode = if lan_mode {
+        // SWBF2 content id; Kyber Module bypasses Denuvo via ReadObfuscatedHk.
+        if game_path_override.is_none() {
+            bail!("LAN mode requires game path override");
         }
+        LaunchMode::Offline("1035052".to_string())
+    } else {
+        let offer_id = {
+            let mut maxima = maxima_arc.lock().await;
+            let game = maxima.mut_library().game_by_base_slug(&game_slug).await;
+            if game.is_err() {
+                bail!(game.err().unwrap())
+            }
 
-        let game = game.unwrap();
-        if !game.is_installed().await {
-            bail!("Game not installed");
-        }
+            let game = game?;
+            if game.is_none() {
+                bail!("Game not found");
+            }
 
-        game.offer_id().to_owned()
+            let game = game.unwrap();
+            if !game.is_installed().await {
+                bail!("Game not installed");
+            }
+
+            game.offer_id().to_owned()
+        };
+        LaunchMode::Online(offer_id)
     };
 
     // TODO: re-enable cloud-saves (@headassbtw please fix)
-    launch::start_game(maxima_arc.clone(), LaunchMode::Online(offer_id), LaunchOptions {
+    launch::start_game(maxima_arc.clone(), mode, LaunchOptions {
         path_override: game_path_override,
         arguments: game_args.unwrap_or_default(),
         cloud_saves: false,
     }).await?;
+
+    // In LAN mode find the real game PID.
+    // Challenge: Steam spawns a wrapper with the same exe name that terminates
+    // before re-spawning the real game. The wrapper holds ~200-300 MB, the real
+    // game allocates 3+ GB even in the main menu. We distinguish by combining:
+    //   1. name == starwarsbattlefrontii.exe
+    //   2. start_time > launch_ref_ts (started after we initiated launch)
+    //   3. memory >= 1 GB (excludes Steam wrapper / loading stages)
+    //   4. PID stable in 2 consecutive scans (sanity check)
+    // 1 GB is a safe floor: a wrapper never reaches it, and the game is always
+    // well above 3 GB once initialized.
+    if lan_mode {
+        use sysinfo::{ProcessExt, System, SystemExt};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let launch_ref_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(30);
+        const MIN_GAME_MEMORY_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
+        const MAX_ATTEMPTS: u32 = 360; // 360 * 500ms = 3 min
+        let mut last_stable_pid: Option<u32> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut sys = System::new();
+            sys.refresh_processes();
+            let mut newest: Option<(u32, u64, u64)> = None; // (pid, start_time, mem)
+            for (pid, proc_) in sys.processes() {
+                let name = proc_.name().to_lowercase();
+                if name != "starwarsbattlefrontii.exe" && name != "starwarsbattlefrontii" {
+                    continue;
+                }
+                let st = proc_.start_time();
+                if st < launch_ref_ts {
+                    continue;
+                }
+                let mem = proc_.memory();
+                if mem < MIN_GAME_MEMORY_BYTES {
+                    continue; // Steam wrapper or loading stage
+                }
+                let pid_u32 = pid.to_string().parse::<u32>().unwrap_or(0);
+                if newest.map(|(_, s, _)| st > s).unwrap_or(true) {
+                    newest = Some((pid_u32, st, mem));
+                }
+            }
+            if let Some((pid, st, mem)) = newest {
+                if last_stable_pid == Some(pid) {
+                    debug!(
+                        "[LAN] Found game PID {} (start_time={}, mem={} MB, attempt {})",
+                        pid,
+                        st,
+                        mem / 1024 / 1024,
+                        attempt
+                    );
+                    return Ok(pid);
+                }
+                last_stable_pid = Some(pid);
+            } else {
+                last_stable_pid = None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        bail!("LAN mode: timed out (3min) waiting for game with >=1GB memory");
+    }
 
     loop {
         let mut maxima = maxima_arc.lock().await;
@@ -454,11 +611,14 @@ async fn login(login_override: Option<String>) -> anyhow::Result<TokenResponse> 
 }
 
 pub async fn get_auth_token() -> String {
+    ensure_maxima().await;
     let y = maxima().lock().await;
     {
         let mut auth_storage = y.auth_storage().lock().await;
-        let token = auth_storage.access_token().await;
-        return token.unwrap().unwrap();
+        match auth_storage.access_token().await {
+            Ok(Some(token)) => token,
+            _ => String::new(),
+        }
     }
 }
 
@@ -583,6 +743,18 @@ pub async fn start_maxima(
 pub fn init_app() {
     // Default utilities - feel free to customize
     flutter_rust_bridge::setup_default_user_utils();
+
+    // In LAN mode, eagerly init Maxima with dummy user so subsequent
+    // synchronous maxima() accesses don't panic on None singleton.
+    if std::env::var("KYBER_LAN_MODE").map(|v| v == "true").unwrap_or(false) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            ensure_maxima().await;
+        });
+    }
 }
 
 flutter_logger::flutter_logger_init!(LevelFilter::Debug);

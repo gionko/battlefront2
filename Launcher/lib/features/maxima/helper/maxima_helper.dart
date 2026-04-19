@@ -153,15 +153,36 @@ class MaximaHelper {
     ProcessEnv.set('KYBER_API_TOKEN', kToken);
     ProcessEnv.set(
       'KYBER_MODULE_VERSION',
-      (await VersionModule.module.getCurrentVersion())!,
+      (await VersionModule.module.getCurrentVersion()) ?? 'lan',
     );
     ProcessEnv.set('KYBER_INTERFACE_PORT', interfacePort.toString());
-    ProcessEnv.set(
-      'KYBER_HTTP_HOSTNAME',
-      sl.get<KyberGRPCService>().httpHostname,
-    );
+    // In LAN mode the Module's gRPC/HTTP clients need explicit ports:
+    // - gRPC target string without :port defaults to 443 in grpc C++
+    // - HTTP client likewise expects :port for non-standard servers
+    // The production KyberGRPCService.fromDefaults() stores hostnames that
+    // resolve to 443/80 via DNS/HTTPS. LAN uses 9027/9028 on raw IPs, so
+    // the env vars must include the port explicitly.
+    final grpc = sl.get<KyberGRPCService>();
+    final apiHostname = isLanMode ? '${grpc.host}:${grpc.port}' : grpc.host;
+    final httpHostname = isLanMode ? '${grpc.httpHostname}:9028' : grpc.httpHostname;
+    ProcessEnv.set('KYBER_HTTP_HOSTNAME', httpHostname);
     ProcessEnv.set('PATH', newPath);
-    ProcessEnv.set('KYBER_API_HOSTNAME', sl.get<KyberGRPCService>().host);
+    ProcessEnv.set('KYBER_API_HOSTNAME', apiHostname);
+    if (isLanMode) {
+      // Module's RPC client defaults to SSL; on LAN our API/Proxy speak
+      // plaintext gRPC, so force the insecure channel. Without this the
+      // Module opens ca_root.pem (which we don't ship on LAN) and enters
+      // a gRPC TRANSIENT_FAILURE loop.
+      ProcessEnv.set('KYBER_INSECURE', '1');
+    } else {
+      ProcessEnv.delete('KYBER_INSECURE');
+    }
+    _logger.info(
+      'Pre-launch env: KYBER_API_TOKEN length=${kToken.length} '
+      'KYBER_API_HOSTNAME=$apiHostname '
+      'KYBER_HTTP_HOSTNAME=$httpHostname '
+      'KYBER_INSECURE=${isLanMode ? "1" : "<unset>"}',
+    );
 
     if (grpcDebug) {
       ProcessEnv.set('GRPC_TRACE', 'all');
@@ -178,9 +199,30 @@ class MaximaHelper {
     }
 
     final gameClient = ClientGRPCService('127.0.0.1', interfacePort);
+
+    // In LAN mode, auto-resolve the game path from the registry if not provided,
+    // or fall back to KYBER_LAN_GAME_PATH env var.
+    String? resolvedGamePath = gamePath;
+    if (isLanMode && (resolvedGamePath == null || resolvedGamePath.isEmpty)) {
+      final fromEnv = Platform.environment['KYBER_LAN_GAME_PATH'];
+      if (fromEnv != null && fromEnv.isNotEmpty) {
+        resolvedGamePath = fromEnv;
+      } else {
+        final detected = maxima.getGameDir(gameSlug: gameSlug ?? 'star-wars-battlefront-2');
+        if (detected.isNotEmpty) {
+          resolvedGamePath = p.join(detected, 'starwarsbattlefrontii.exe');
+        }
+      }
+      _logger.info('LAN mode resolved game path: $resolvedGamePath');
+    }
+
+    // Do NOT pass -alwaysoffline: with that flag the game skips the LSX
+    // RequestLicense handshake that the Launcher waits on to inject
+    // Kyber.dll. LSX acts as a local EA service, so the game can safely
+    // contact it even in LAN mode.
     final gamePID = await maxima.startGame(
       gameSlug: gameSlug ?? 'star-wars-battlefront-2',
-      gamePathOverride: gamePath,
+      gamePathOverride: resolvedGamePath,
     );
     _logger.info('Started game with PID: $gamePID');
 
@@ -207,9 +249,15 @@ class MaximaHelper {
       sl.get<KyberGRPCServer>().setInitializeRequest(
         initializeRequest ?? InitializeRequest(),
       );
-      await maxima
-          .lsxGetEventStream(pid: gamePID, isStartup: true)
-          .firstWhere((e) => e == 'RequestLicense');
+      if (!isLanMode) {
+        await maxima
+            .lsxGetEventStream(pid: gamePID, isStartup: true)
+            .firstWhere((e) => e == 'RequestLicense');
+      } else {
+        // In LAN mode (e.g. Steam version) the game doesn't hit LSX with
+        // RequestLicense, so we inject Kyber.dll as soon as the PID is known.
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
       await maxima.injectKyber(
         pid: gamePID,
         path: p.join(FileHelper.getModuleDirectory().path, 'Kyber.dll'),
